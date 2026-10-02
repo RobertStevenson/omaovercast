@@ -10,6 +10,8 @@ same endpoint its web player uses.
   overcast play <path>         play an episode (path like /+BTY0S2CNU4)
   overcast status              JSON now-playing state
   overcast toggle|stop         pause/resume or stop playback
+  overcast media-key back|forward  seek the episode if it's what you're listening to,
+                               else Omarchy's previous/next track (for media key bindings)
   overcast logout              stop playback, end the session, delete the cookie
   overcast seek <seconds>      relative seek
   overcast speed <id>          set speed by Overcast id (750, 0=1x, 1250 ... 3000)
@@ -37,6 +39,7 @@ COOKIE_JAR = os.path.join(STATE_DIR, "cookies.txt")
 NOW_FILE = os.path.join(STATE_DIR, "now.json")
 PROGRESS_FINISHED_SENTINEL = 0x7FFFFFFF
 SYNC_INTERVAL = 10
+SEEK_BACK, SEEK_FORWARD = 15, 30  # seconds, like Overcast's buttons
 OLDER_EPISODES = 4  # default count shown after the episodes still in your library
 ALL_EPISODES_LIMIT = 30  # "All": the newest episodes of the feed, whatever their state
 SPEED_IDS = (750, 0, 1250, 1500, 1750, 2000, 2500, 3000)  # Overcast's options; 0 means 1x
@@ -417,6 +420,46 @@ def session(details):
         remove_own_files(me)
 
 
+def other_player_playing(own_pid):
+    """Whether any MPRIS player other than our mpv is currently playing."""
+    try:
+        names = json.loads(subprocess.run(
+            ["busctl", "--user", "list", "--json=short"],
+            capture_output=True, text=True, timeout=3).stdout or "[]")
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return False
+    for entry in names:
+        name = entry.get("name", "")
+        if not name.startswith("org.mpris.MediaPlayer2.") or entry.get("pid") == own_pid:
+            continue
+        try:
+            out = subprocess.run(
+                ["busctl", "--user", "get-property", name, "/org/mpris/MediaPlayer2",
+                 "org.mpris.MediaPlayer2.Player", "PlaybackStatus"],
+                capture_output=True, text=True, timeout=2).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if '"Playing"' in out:
+            return True
+    return False
+
+
+def media_key(direction):
+    """Rewind/fast-forward keys: seek the episode when it's what you're listening to,
+    otherwise do Omarchy's usual previous/next track."""
+    now = current_session()
+    if now:
+        mpv_pid = mpv_get(now["socket"], "pid")
+        paused = bool(mpv_get(now["socket"], "pause"))
+        if not paused or not other_player_playing(mpv_pid):
+            seconds = -SEEK_BACK if direction == "back" else SEEK_FORWARD
+            mpv(now["socket"], "seek", seconds, "relative")
+            return {"ok": True, "seeked": seconds}
+    subprocess.run(["omarchy-shell", "media", "previous" if direction == "back" else "next"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+    return {"ok": True, "track": direction}
+
+
 def logout():
     """Stop playback (saving its position), end the Overcast session, forget the cookie."""
     with PlayLock():
@@ -491,6 +534,10 @@ def main(argv):
                 raise RuntimeError(f"Unsupported speed {speed_id}")
             control("set_property", "speed", speed_multiplier(speed_id))
             result = {"ok": True}
+        elif cmd == "media-key":
+            if not args or args[0] not in ("back", "forward"):
+                raise RuntimeError("media-key needs back or forward")
+            result = media_key(args[0])
         elif cmd == "logout":
             result = logout()
         elif cmd == "stop":

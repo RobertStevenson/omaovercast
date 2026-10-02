@@ -72,6 +72,22 @@ To sign out, open the settings page (gear icon) and choose **Log out**. This sto
 | Esc | Close the speed menu, go back, or close the panel |
 | Overcast logo / title | Open overcast.fm in your browser |
 
+### Rewind and fast-forward keys (optional)
+
+Your keyboard's previous/next (or rewind/fast-forward) keys can jump back 15 seconds and forward 30 seconds in the episode, and still skip tracks in other players. `overcast media-key` seeks when an OmaOvercast episode is playing, or is paused while nothing else is. Otherwise it does Omarchy's usual previous/next track. Add this to `~/.config/hypr/bindings.lua`:
+
+```lua
+hl.unbind("XF86AudioPrev")
+hl.unbind("XF86AudioNext")
+local omaovercast = "~/.config/omarchy/plugins/robertstevenson.omaovercast/bin/overcast media-key "
+o.bind("XF86AudioPrev", "Back 15s / previous track", omaovercast .. "back", { locked = true })
+o.bind("XF86AudioNext", "Forward 30s / next track", omaovercast .. "forward", { locked = true })
+o.bind("XF86AudioRewind", "Back 15s / previous track", omaovercast .. "back", { locked = true })
+o.bind("XF86AudioForward", "Forward 30s / next track", omaovercast .. "forward", { locked = true })
+```
+
+Remove those lines to go back to Omarchy's default track skipping.
+
 ## Settings
 
 Open them with the gear icon in the panel. Changes are saved to the widget's entry in `~/.config/omarchy/shell.json`.
@@ -104,6 +120,7 @@ overcast status              JSON now-playing state
 overcast toggle | stop       pause/resume or stop playback
 overcast seek <seconds>      relative seek
 overcast speed <id>          set speed by Overcast id (750, 0=1x, 1250 ... 3000)
+overcast media-key back|forward  seek the episode, or previous/next track in other players
 overcast logout              stop playback, end the session, delete the cookie
 ```
 
