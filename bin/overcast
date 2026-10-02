@@ -1,0 +1,514 @@
+#!/usr/bin/env python3
+"""Overcast backend for the omarchy shell plugin.
+
+Scrapes the logged-in overcast.fm web pages (there is no public API), plays
+episodes with mpv, and syncs playback position back to Overcast using the
+same endpoint its web player uses.
+
+  overcast podcasts            JSON list of subscribed podcasts
+  overcast episodes <path> [n] in-library episodes plus n older (None, 1-5), or All (newest 30)
+  overcast play <path>         play an episode (path like /+BTY0S2CNU4)
+  overcast status              JSON now-playing state
+  overcast toggle|stop         pause/resume or stop playback
+  overcast logout              stop playback, end the session, delete the cookie
+  overcast seek <seconds>      relative seek
+  overcast speed <id>          set speed by Overcast id (750, 0=1x, 1250 ... 3000)
+"""
+
+import ctypes
+import fcntl
+import html
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+BASE = "https://overcast.fm"
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "omaovercast")
+COOKIE_JAR = os.path.join(STATE_DIR, "cookies.txt")
+NOW_FILE = os.path.join(STATE_DIR, "now.json")
+PROGRESS_FINISHED_SENTINEL = 0x7FFFFFFF
+SYNC_INTERVAL = 10
+OLDER_EPISODES = 4  # default count shown after the episodes still in your library
+ALL_EPISODES_LIMIT = 30  # "All": the newest episodes of the feed, whatever their state
+SPEED_IDS = (750, 0, 1250, 1500, 1750, 2000, 2500, 3000)  # Overcast's options; 0 means 1x
+
+
+class NotLoggedIn(Exception):
+    pass
+
+
+# --- HTTP -------------------------------------------------------------------
+
+def cookie_header():
+    """Build a Cookie header from curl's Netscape-format jar."""
+    try:
+        with open(COOKIE_JAR) as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        raise NotLoggedIn()
+    pairs = []
+    for line in lines:
+        if line.startswith("#HttpOnly_"):
+            line = line[len("#HttpOnly_"):]
+        elif not line or line.startswith("#"):
+            continue
+        fields = line.split("\t")
+        if len(fields) == 7 and fields[0].lstrip(".").endswith("overcast.fm"):
+            pairs.append(f"{fields[5]}={fields[6]}")
+    if not pairs:
+        raise NotLoggedIn()
+    return "; ".join(pairs)
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+_opener = urllib.request.build_opener(NoRedirect)
+
+
+def request(path, data=None):
+    req = urllib.request.Request(BASE + path, data=data, headers={
+        "Cookie": cookie_header(),
+        "User-Agent": "OmaOvercast/1.0",
+    })
+    try:
+        with _opener.open(req, timeout=15) as resp:
+            return resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        if e.code in (301, 302, 303) and "/login" in (e.headers.get("Location") or ""):
+            raise NotLoggedIn()
+        raise
+
+
+# --- Scraping ---------------------------------------------------------------
+
+def text(fragment):
+    return html.unescape(re.sub(r"<[^>]+>", "", fragment)).strip()
+
+
+FEED_CELL = re.compile(
+    r'<a class="feedcell" href="(?P<href>[^"]+)">\s*<img class="art" src="(?P<art>[^"]+)">'
+    r'(?P<body>.*?)<div class="title">(?P<title>.*?)</div>', re.S)
+
+EPISODE_CELL = re.compile(
+    r'<a class="extendedepisodecell (?P<state>[\w ]+)" href="(?P<href>/\+[^"]+)">'
+    r'.*?<div class="title singleline">(?P<title>.*?)</div>'
+    r'\s*<div class="caption2 singleline">(?P<caption>.*?)</div>', re.S)
+
+
+def podcasts():
+    page = request("/podcasts")
+    out = []
+    for m in FEED_CELL.finditer(page):
+        if m["href"] == "/uploads":
+            continue
+        out.append({
+            "title": text(m["title"]),
+            "path": m["href"],
+            "art": m["art"],
+            "unplayed": "unplayed_indicator" in m["body"],
+        })
+    return out
+
+
+def episodes(path, older=OLDER_EPISODES):
+    """Episodes still in your library, then a few just older than the oldest of them.
+
+    The page lists newest first. Episodes not in your library that are newer than
+    (or between) the in-library ones are skipped. older=None ("All") instead returns
+    the newest ALL_EPISODES_LIMIT episodes in feed order.
+    """
+    page = request(path)
+    cells = [{
+        "title": text(m["title"]),
+        "path": m["href"],
+        "caption": " ".join(text(m["caption"]).split()),
+        "new": "usernewepisode" in m["state"],
+    } for m in EPISODE_CELL.finditer(page)]
+    if older is None:
+        selected = cells[:ALL_EPISODES_LIMIT]
+        for cell in selected:
+            cell["played"] = not cell["new"]
+        return selected
+    new_indexes = [i for i, cell in enumerate(cells) if cell["new"]]
+    oldest_new = new_indexes[-1] if new_indexes else -1
+    selected = [cells[i] for i in new_indexes] + cells[oldest_new + 1:oldest_new + 1 + older]
+    for cell in selected:
+        cell["played"] = not cell["new"]
+    return selected
+
+
+def episode_details(path):
+    page = request(path)
+    audio = re.search(r'<audio id="audioplayer"(.*?)</audio>', page, re.S)
+    if not audio:
+        raise RuntimeError("No audio player found on episode page")
+    block = audio.group(1)
+
+    def attr(name, default=""):
+        m = re.search(rf'data-{name}="([^"]*)"', block)
+        return html.unescape(m.group(1)) if m else default
+
+    src = re.search(r'<source src="([^"]+)"', block)
+    if not src:
+        raise RuntimeError("No audio source found on episode page")
+    podcast_link = re.search(r'<h3 class="marginbottom05"><a href="([^"]+)"', page)
+    return {
+        "path": path,
+        "podcastPath": podcast_link.group(1) if podcast_link else "",
+        "url": html.unescape(src.group(1)).split("#t=")[0],
+        "itemId": attr("item-id"),
+        "start": int(attr("start-time", "0") or 0),
+        "syncVersion": int(attr("sync-version", "0") or 0),
+        "speedId": int(attr("speed-id", "1000") or 1000),
+        "title": attr("title"),
+        "podcast": attr("podcast-title"),
+        "art": attr("artwork-url"),
+    }
+
+
+def set_progress(item_id, position, speed_id, version):
+    body = urllib.parse.urlencode({"p": int(position), "speed": speed_id, "v": version}).encode()
+    try:
+        reply = request(f"/podcasts/set_progress/{item_id}", data=body)
+        return int(reply.strip() or 0) or version
+    except (urllib.error.URLError, ValueError, NotLoggedIn, OSError):
+        return version
+
+
+def speed_multiplier(speed_id):
+    return speed_id / 1000 if speed_id else 1.0
+
+
+def speed_id_for(multiplier):
+    speed_id = int(round(multiplier * 1000))
+    return 0 if speed_id == 1000 else speed_id
+
+
+# --- Playback sessions ---------------------------------------------------------
+#
+# One session process owns one mpv process and syncs its position to Overcast.
+# NOW_FILE describes the current session (its pid and private mpv socket). Only
+# one session may exist: play/stop/logout hold PLAY_LOCK while they stop the old
+# session and start the new one, and a session only ever removes its own files.
+
+def mpv(sock, *command):
+    """Send one command over an mpv JSON IPC socket and return its data."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(2)
+        s.connect(sock)
+        s.sendall(json.dumps({"command": list(command), "request_id": 1}).encode() + b"\n")
+        buf = b""
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                return None
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                msg = json.loads(line)
+                if msg.get("request_id") == 1:
+                    return msg.get("data")
+
+
+def mpv_get(sock, prop):
+    try:
+        return mpv(sock, "get_property", prop)
+    except (OSError, ValueError):
+        return None
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def read_now():
+    try:
+        with open(NOW_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def write_now(data):
+    tmp = NOW_FILE + f".{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, NOW_FILE)
+
+
+def current_session():
+    """The live session's NOW_FILE contents, or None (clearing a stale file)."""
+    now = read_now()
+    if not now:
+        return None
+    if not isinstance(now.get("pid"), int) or not pid_alive(now["pid"]):
+        remove_own_files(now)
+        return None
+    return now
+
+
+def remove_own_files(now):
+    """Remove a session's socket, and NOW_FILE only if it still describes that session."""
+    if now.get("socket"):
+        try:
+            os.unlink(now["socket"])
+        except FileNotFoundError:
+            pass
+    current = read_now()
+    if current and current.get("pid") == now.get("pid"):
+        try:
+            os.unlink(NOW_FILE)
+        except FileNotFoundError:
+            pass
+
+
+def control(*command):
+    now = current_session()
+    if not now:
+        raise RuntimeError("Nothing is playing")
+    return mpv(now["socket"], *command)
+
+
+class PlayLock:
+    def __enter__(self):
+        self.f = open(os.path.join(STATE_DIR, "play.lock"), "w")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.f, fcntl.LOCK_UN)
+        self.f.close()
+
+
+def wait_for_exit(pid, seconds):
+    for _ in range(int(seconds * 10)):
+        if not pid_alive(pid):
+            return True
+        time.sleep(0.1)
+    return not pid_alive(pid)
+
+
+def stop_playback():
+    """Stop the current session and wait for it to save its position. Call with PlayLock held."""
+    now = current_session()
+    if not now:
+        return
+    pid = now["pid"]
+    try:
+        mpv(now["socket"], "quit")
+    except (OSError, ValueError):
+        pass  # Still loading, or its socket is gone: fall through to signals.
+    # The session saves the final position (a network request) before exiting.
+    if not wait_for_exit(pid, 8):
+        os.kill(pid, signal.SIGTERM)
+        if not wait_for_exit(pid, 8):
+            os.kill(pid, signal.SIGKILL)
+            wait_for_exit(pid, 2)
+    remove_own_files(now)
+
+
+def play(path):
+    if not shutil.which("mpv"):
+        raise RuntimeError("mpv is not installed")
+    details = episode_details(path)
+    with PlayLock():
+        stop_playback()
+        child = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "_session", json.dumps(details)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+        # Hold the lock until the new session is controllable, so a second
+        # play right after this one stops it cleanly instead of racing it.
+        for _ in range(150):
+            now = read_now()
+            if now and now.get("pid") == child.pid and os.path.exists(now["socket"]):
+                return {"ok": True, "title": details["title"]}
+            if child.poll() is not None:
+                break
+            time.sleep(0.1)
+    raise RuntimeError("Playback didn't start")
+
+
+def _die_with_parent():
+    # mpv exits if its session process dies, so it can never be orphaned.
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    libc.prctl(1, signal.SIGTERM)  # PR_SET_PDEATHSIG
+
+
+def session(details):
+    """Long-running: own the mpv process and sync position to Overcast."""
+    sock = os.path.join(STATE_DIR, f"mpv-{os.getpid()}.sock")
+    me = dict(details, pid=os.getpid(), socket=sock)
+
+    def on_signal(signum, frame):
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGHUP, on_signal)
+
+    speed_id = details["speedId"]
+    player = subprocess.Popen([
+        "mpv", "--no-video", "--no-terminal", "--idle=no",
+        # Jump to the saved position by byte estimate instead of reading the
+        # whole file up to it, which can take a minute or more on slow hosts.
+        "--demuxer-lavf-o=fflags=+fastseek",
+        f"--input-ipc-server={sock}",
+        f"--start={details['start']}",
+        f"--speed={speed_multiplier(speed_id)}",
+        f"--force-media-title={details['title']}",
+        details["url"],
+    ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        preexec_fn=_die_with_parent)
+
+    version = details["syncVersion"]
+    last_synced = details["start"]
+    position, duration = None, None
+    try:
+        # Announce the session once mpv is listening.
+        for _ in range(100):
+            if os.path.exists(sock) or player.poll() is not None:
+                break
+            time.sleep(0.1)
+        write_now(me)
+
+        while player.poll() is None:
+            time.sleep(1)
+            pos = mpv_get(sock, "time-pos")
+            if pos is None:
+                continue
+            position = pos
+            duration = mpv_get(sock, "duration") or duration
+            # A speed change is saved right away, like the web player does.
+            current_speed_id = speed_id_for(mpv_get(sock, "speed") or speed_multiplier(speed_id))
+            speed_changed = current_speed_id != speed_id
+            speed_id = current_speed_id
+            if speed_changed or abs(position - last_synced) >= SYNC_INTERVAL:
+                version = set_progress(details["itemId"], position, speed_id, version)
+                last_synced = position
+    finally:
+        if player.poll() is None:
+            player.terminate()
+            try:
+                player.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                player.kill()
+        # Only save a position this session actually observed.
+        if position is not None:
+            finished = duration is not None and position >= duration - 5
+            final = PROGRESS_FINISHED_SENTINEL if finished else position
+            set_progress(details["itemId"], final, speed_id, version)
+        remove_own_files(me)
+
+
+def logout():
+    """Stop playback (saving its position), end the Overcast session, forget the cookie."""
+    with PlayLock():
+        stop_playback()
+    try:
+        request("/logout")
+    except (urllib.error.URLError, NotLoggedIn, OSError):
+        pass  # A redirect or an already-dead session still means we're logged out.
+    try:
+        os.unlink(COOKIE_JAR)
+    except FileNotFoundError:
+        pass
+    return {"ok": True}
+
+
+def status():
+    now = current_session()
+    if not now:
+        return {"active": False}
+    sock = now["socket"]
+    return {
+        "active": True,
+        "title": now.get("title", ""),
+        "podcast": now.get("podcast", ""),
+        "art": now.get("art", ""),
+        "path": now.get("path", ""),
+        "podcastPath": now.get("podcastPath", ""),
+        "position": mpv_get(sock, "time-pos") or 0,
+        "duration": mpv_get(sock, "duration") or 0,
+        "paused": bool(mpv_get(sock, "pause")),
+        "speedId": speed_id_for(mpv_get(sock, "speed") or 1.0),
+    }
+
+
+def parse_older(value):
+    """'None' -> 0, 'All' -> None (no limit), digits -> that many."""
+    if value is None:
+        return OLDER_EPISODES
+    if value.lower() == "all":
+        return None
+    if value.lower() == "none":
+        return 0
+    return max(0, int(value))
+
+
+# --- CLI ------------------------------------------------------------------------
+
+def main(argv):
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    cmd, args = (argv[0] if argv else "status"), argv[1:]
+    try:
+        if cmd == "podcasts":
+            result = podcasts()
+        elif cmd == "episodes":
+            result = episodes(args[0], parse_older(args[1] if len(args) > 1 else None))
+        elif cmd == "play":
+            result = play(args[0])
+        elif cmd == "_session":
+            session(json.loads(args[0]))
+            return 0
+        elif cmd == "status":
+            result = status()
+        elif cmd == "toggle":
+            control("cycle", "pause")
+            result = {"ok": True}
+        elif cmd == "seek":
+            control("seek", float(args[0]), "relative")
+            result = {"ok": True}
+        elif cmd == "speed":
+            speed_id = int(args[0])
+            if speed_id not in SPEED_IDS:
+                raise RuntimeError(f"Unsupported speed {speed_id}")
+            control("set_property", "speed", speed_multiplier(speed_id))
+            result = {"ok": True}
+        elif cmd == "logout":
+            result = logout()
+        elif cmd == "stop":
+            with PlayLock():
+                stop_playback()
+            result = {"ok": True}
+        else:
+            print(__doc__, file=sys.stderr)
+            return 64
+    except NotLoggedIn:
+        print(json.dumps({"error": "not_logged_in"}))
+        return 2
+    except (OSError, RuntimeError, urllib.error.URLError) as e:
+        print(json.dumps({"error": str(e)}))
+        return 1
+    print(json.dumps(result))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

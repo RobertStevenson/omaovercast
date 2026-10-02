@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# One-time Overcast login. Stores only the session cookie; the password is never written to disk.
+set -euo pipefail
+
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/omaovercast"
+jar="$state_dir/cookies.txt"
+mkdir -p "$state_dir"
+chmod 700 "$state_dir"
+
+read -rp "Overcast email: " email
+read -rsp "Password: " password
+echo
+
+umask 077
+tmp="$(mktemp "$state_dir/cookies.XXXXXX")"
+trap 'rm -f "$tmp"' EXIT
+
+# Password goes via stdin so it never shows up in the process list.
+status=$(printf '%s' "$password" | curl -sS -o /dev/null -w '%{http_code} %{redirect_url}' \
+  -c "$tmp" \
+  --data-urlencode "then=podcasts" \
+  --data-urlencode "email=$email" \
+  --data-urlencode "password@-" \
+  https://overcast.fm/login)
+unset password
+
+if [[ "$status" == 302* && "$status" != *"/login"* ]] && grep -q 'overcast.fm' "$tmp"; then
+  mv "$tmp" "$jar"
+  trap - EXIT
+  echo "Logged in. Session cookie saved to $jar"
+else
+  echo "Login failed (HTTP $status)." >&2
+  exit 1
+fi

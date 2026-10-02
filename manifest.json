@@ -1,0 +1,68 @@
+{
+  "schemaVersion": 1,
+  "id": "robertstevenson.omaovercast",
+  "name": "OmaOvercast",
+  "version": "1.0.0",
+  "author": "RobertStevenson",
+  "license": "MIT",
+  "description": "Unofficial Overcast player for the Omarchy bar: browse your subscriptions, play episodes with mpv, and sync progress and speed back to your Overcast account.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "OmaOvercast",
+    "description": "Your Overcast podcasts and episodes, played with mpv, with progress synced to your account.",
+    "category": "Media",
+    "aliases": [
+      "overcast",
+      "podcast",
+      "podcasts"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "showArtwork": false,
+      "accentColor": "Overcast",
+      "olderEpisodes": "4"
+    },
+    "schema": [
+      {
+        "key": "showArtwork",
+        "type": "boolean",
+        "label": "Show artwork",
+        "defaultValue": false,
+        "description": "Show podcast artwork in the list and now-playing card."
+      },
+      {
+        "key": "accentColor",
+        "type": "enum",
+        "label": "Accent color",
+        "options": [
+          "Overcast",
+          "Theme"
+        ],
+        "defaultValue": "Overcast",
+        "description": "Use Overcast orange, or the current Omarchy theme's accent color, for controls and highlights."
+      },
+      {
+        "key": "olderEpisodes",
+        "type": "enum",
+        "label": "Older episodes",
+        "options": [
+          "None",
+          "1",
+          "2",
+          "3",
+          "4",
+          "5",
+          "All"
+        ],
+        "defaultValue": "4",
+        "description": "How many episodes older than the ones in your Overcast library to show for each podcast."
+      }
+    ]
+  }
+}
