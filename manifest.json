@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "robertstevenson.omaovercast",
   "name": "OmaOvercast",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "RobertStevenson",
   "license": "MIT",
   "description": "Unofficial Overcast player for the Omarchy bar: browse your subscriptions, play episodes with mpv, and sync progress and speed back to your Overcast account.",

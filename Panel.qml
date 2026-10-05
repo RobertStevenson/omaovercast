@@ -140,6 +140,11 @@ Panel {
   }
   function togglePause() { if (nowPlaying.active) action(["toggle"]) }
   function seek(seconds) { action(["seek", String(seconds)]) }
+  // Moves the bar right away so the knob doesn't snap back until the next poll.
+  function seekTo(seconds) {
+    nowPlaying = Object.assign({}, nowPlaying, { position: seconds })
+    action(["seek", String(seconds), "absolute"])
+  }
 
   function setSpeed(speedId) {
     speedMenuOpen = false
@@ -523,19 +528,19 @@ Panel {
             width: parent.width
             spacing: Style.space(5)
 
-            Rectangle {
+            // Drag the knob, click the track, or scroll (15s per notch) to seek.
+            PanelSlider {
               width: parent.width
-              height: Style.space(4)
-              radius: height / 2
-              color: Util.alpha(root.fg, 0.15)
-
-              Rectangle {
-                height: parent.height
-                radius: parent.radius
-                color: root.brand
-                width: root.nowPlaying.duration > 0
-                  ? parent.width * Math.min(1, root.nowPlaying.position / root.nowPlaying.duration) : 0
-              }
+              bar: root.bar
+              enabled: root.nowPlaying.duration > 0
+              minimum: 0
+              maximum: Math.max(1, root.nowPlaying.duration || 0)
+              value: root.nowPlaying.position || 0
+              step: 15
+              trackColor: Util.alpha(root.fg, 0.15)
+              fillColor: root.brand
+              knobColor: root.brand
+              onReleased: function(value) { root.seekTo(value) }
             }
 
             Item {

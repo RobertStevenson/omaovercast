@@ -118,7 +118,7 @@ overcast episodes <path> [n] in-library episodes plus n older (None, 1-5), or Al
 overcast play <path>         play an episode
 overcast status              JSON now-playing state
 overcast toggle | stop       pause/resume or stop playback
-overcast seek <seconds>      relative seek
+overcast seek <seconds> [absolute]  relative seek, or to a position
 overcast speed <id>          set speed by Overcast id (750, 0=1x, 1250 ... 3000)
 overcast media-key back|forward  seek the episode, or previous/next track in other players
 overcast logout              stop playback, end the session, delete the cookie

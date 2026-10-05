@@ -13,7 +13,7 @@ same endpoint its web player uses.
   overcast media-key back|forward  seek the episode if it's what you're listening to,
                                else Omarchy's previous/next track (for media key bindings)
   overcast logout              stop playback, end the session, delete the cookie
-  overcast seek <seconds>      relative seek
+  overcast seek <seconds> [absolute]  relative seek, or to a position
   overcast speed <id>          set speed by Overcast id (750, 0=1x, 1250 ... 3000)
 """
 
@@ -526,7 +526,8 @@ def main(argv):
             control("cycle", "pause")
             result = {"ok": True}
         elif cmd == "seek":
-            control("seek", float(args[0]), "relative")
+            mode = "absolute" if len(args) > 1 and args[1] == "absolute" else "relative"
+            control("seek", float(args[0]), mode)
             result = {"ok": True}
         elif cmd == "speed":
             speed_id = int(args[0])
