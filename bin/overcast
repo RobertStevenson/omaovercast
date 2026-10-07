@@ -14,7 +14,9 @@ same endpoint its web player uses.
                                else Omarchy's previous/next track (for media key bindings)
   overcast logout              stop playback, end the session, delete the cookie
   overcast seek <seconds> [absolute]  relative seek, or to a position
-  overcast speed <id>          set speed by Overcast id (750, 0=1x, 1250 ... 3000)
+  overcast speed <id>          set speed by Overcast id (750, 0=1x, 1250 ... 2000)
+  overcast info <path>         JSON episode and podcast details for the info dialog
+  overcast resync              adopt a newer position saved by another device, if any
 """
 
 import ctypes
@@ -39,10 +41,12 @@ COOKIE_JAR = os.path.join(STATE_DIR, "cookies.txt")
 NOW_FILE = os.path.join(STATE_DIR, "now.json")
 PROGRESS_FINISHED_SENTINEL = 0x7FFFFFFF
 SYNC_INTERVAL = 10
+RESYNC_TOLERANCE = 5  # seconds of drift from the saved position that count as another device
+WAKE_GAP = 8  # a session loop that stalls this long (seconds) means the machine slept
 SEEK_BACK, SEEK_FORWARD = 15, 30  # seconds, like Overcast's buttons
 OLDER_EPISODES = 4  # default count shown after the episodes still in your library
 ALL_EPISODES_LIMIT = 30  # "All": the newest episodes of the feed, whatever their state
-SPEED_IDS = (750, 0, 1250, 1500, 1750, 2000, 2500, 3000)  # Overcast's options; 0 means 1x
+SPEED_IDS = (750, 0, 1250, 1500, 1750, 2000)  # Overcast's options; 0 means 1x
 
 
 class NotLoggedIn(Exception):
@@ -152,8 +156,8 @@ def episodes(path, older=OLDER_EPISODES):
     return selected
 
 
-def episode_details(path):
-    page = request(path)
+def episode_details(path, page=None):
+    page = page or request(path)
     audio = re.search(r'<audio id="audioplayer"(.*?)</audio>', page, re.S)
     if not audio:
         raise RuntimeError("No audio player found on episode page")
@@ -167,8 +171,10 @@ def episode_details(path):
     if not src:
         raise RuntimeError("No audio source found on episode page")
     podcast_link = re.search(r'<h3 class="marginbottom05"><a href="([^"]+)"', page)
+    date = re.search(r'<h2 class="[^"]*\btitle\b[^"]*">.*?</h2>\s*<div class="[^"]*lighttext[^"]*">(.*?)</div>', page, re.S)
     return {
         "path": path,
+        "date": text(date.group(1)) if date else "",
         "podcastPath": podcast_link.group(1) if podcast_link else "",
         "url": html.unescape(src.group(1)).split("#t=")[0],
         "itemId": attr("item-id"),
@@ -179,6 +185,35 @@ def episode_details(path):
         "podcast": attr("podcast-title"),
         "art": attr("artwork-url"),
     }
+
+
+def episode_info(path):
+    """Everything Overcast's web pages say about an episode and its podcast."""
+    page = request(path)
+    details = episode_details(path, page)
+    website = re.search(r'<a href="([^"]+)">Website</a>', page)
+    info = {
+        "title": details["title"],
+        "podcast": details["podcast"],
+        "date": details["date"],
+        "art": details["art"],
+        "website": html.unescape(website.group(1)) if website else "",
+        "podcastDescription": "",
+        "podcastSite": "",
+        "notes": "",
+    }
+    if details["podcastPath"]:
+        try:
+            pod = request(details["podcastPath"])
+        except (urllib.error.URLError, OSError):
+            pod = ""
+        desc = re.search(r'<div class="margintop1 marginbottom1 lighttext">(.*?)</div>', pod, re.S)
+        site = re.search(r'<div class="margintop0 caption2">(.*?)</div>', pod, re.S)
+        cell = re.search(re.escape(f'href="{path}"') + r'.*?<div class="lighttext margintop05">(.*?)</div>', pod, re.S)
+        info["podcastDescription"] = " ".join(text(desc.group(1)).split()) if desc else ""
+        info["podcastSite"] = " ".join(text(site.group(1)).split()) if site else ""
+        info["notes"] = " ".join(text(cell.group(1)).split()) if cell else ""
+    return info
 
 
 def set_progress(item_id, position, speed_id, version):
@@ -383,6 +418,27 @@ def session(details):
     version = details["syncVersion"]
     last_synced = details["start"]
     position, duration = None, None
+    resync_wanted = []
+
+    def resync():
+        """Another device listened since we last synced: jump to where it got to."""
+        nonlocal version, last_synced, speed_id
+        try:
+            remote = episode_details(details["path"])
+        except (urllib.error.URLError, NotLoggedIn, RuntimeError, OSError):
+            return
+        if remote["syncVersion"] == version:
+            return
+        version = remote["syncVersion"]
+        if remote["start"] > 0 and (duration is None or remote["start"] < duration - 5):
+            if position is None or abs(remote["start"] - position) > RESYNC_TOLERANCE:
+                mpv(sock, "seek", remote["start"], "absolute")
+            last_synced = remote["start"]
+        if remote["speedId"] != speed_id:
+            speed_id = remote["speedId"]
+            mpv(sock, "set_property", "speed", speed_multiplier(speed_id))
+
+    signal.signal(signal.SIGUSR1, lambda signum, frame: resync_wanted.append(1))
     try:
         # Announce the session once mpv is listening.
         for _ in range(100):
@@ -391,8 +447,18 @@ def session(details):
             time.sleep(0.1)
         write_now(me)
 
+        last_wall = time.time()
         while player.poll() is None:
             time.sleep(1)
+            # A loop that stalled for many seconds means the machine slept.
+            slept = time.time() - last_wall > WAKE_GAP
+            last_wall = time.time()
+            if resync_wanted or slept:
+                del resync_wanted[:]
+                try:
+                    resync()
+                except (OSError, ValueError):
+                    pass
             pos = mpv_get(sock, "time-pos")
             if pos is None:
                 continue
@@ -487,6 +553,7 @@ def status():
         "art": now.get("art", ""),
         "path": now.get("path", ""),
         "podcastPath": now.get("podcastPath", ""),
+        "date": now.get("date", ""),
         "position": mpv_get(sock, "time-pos") or 0,
         "duration": mpv_get(sock, "duration") or 0,
         "paused": bool(mpv_get(sock, "pause")),
@@ -534,6 +601,13 @@ def main(argv):
             if speed_id not in SPEED_IDS:
                 raise RuntimeError(f"Unsupported speed {speed_id}")
             control("set_property", "speed", speed_multiplier(speed_id))
+            result = {"ok": True}
+        elif cmd == "info":
+            result = episode_info(args[0])
+        elif cmd == "resync":
+            now = current_session()
+            if now:
+                os.kill(now["pid"], signal.SIGUSR1)
             result = {"ok": True}
         elif cmd == "media-key":
             if not args or args[0] not in ("back", "forward"):

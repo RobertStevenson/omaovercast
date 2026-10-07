@@ -12,7 +12,8 @@ An unofficial [Overcast](https://overcast.fm) podcast player for the Omarchy bar
 - **Episodes:** for each podcast, the episodes still in your Overcast library, followed by a few older ones. You choose how many.
 - **Playback with mpv:** resumes where you left off, at the speed you set in Overcast.
 - **Progress sync:** your position is saved to your Overcast account every 10 seconds of listening and whenever you stop. An episode played to the end is marked finished, just as in the Overcast apps.
-- **Now-playing screen:** large 15-second-back, play/pause and 30-second-forward controls, plus a speed menu (0.75× to 3×). Speed changes are saved to Overcast right away.
+- **Now-playing screen:** large 15-second-back, play/pause and 30-second-forward controls, plus a speed menu (0.75× to 2×), the episode date, and an ⓘ button that opens the podcast and episode details Overcast shows (description, notes snippet, website link; artwork follows the setting). Speed changes are saved to Overcast right away.
+- **Stays in sync across devices:** when you open the panel, or after your computer wakes from sleep, the player jumps to the position another device saved in Overcast.
 - **Works with your media keys:** the built-in `omarchy.media` widget and the media keys control playback through mpv's MPRIS support.
 - **Sign-in page:** if you're not signed in, or your session expires, the panel shows a sign-in page. It recovers on its own once you've logged in.
 

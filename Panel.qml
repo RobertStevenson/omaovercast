@@ -29,15 +29,22 @@ Panel {
   // Overcast's speed ids; 0 means 1x.
   readonly property var speedOptions: [
     { id: 750, label: "0.75×" }, { id: 0, label: "1×" }, { id: 1250, label: "1.25×" }, { id: 1500, label: "1.5×" },
-    { id: 1750, label: "1.75×" }, { id: 2000, label: "2×" }, { id: 2500, label: "2.5×" }, { id: 3000, label: "3×" }
+    { id: 1750, label: "1.75×" }, { id: 2000, label: "2×" }
   ]
   property bool speedMenuOpen: false
   property bool settingsOpen: false
+  property bool infoOpen: false
+  property var episodeInfo: null
+  property string episodeInfoPath: ""
+  property bool episodeInfoFailed: false
+  // Fetch the info dialog's content as soon as an episode starts, so opening it is instant.
+  readonly property string nowPath: nowPlaying.active ? (nowPlaying.path || "") : ""
+  onNowPathChanged: loadInfo()
   readonly property bool needsLogin: error === "not_logged_in"
   // The sign-in page replaces whatever was showing.
   onNeedsLoginChanged: if (needsLogin) view = "podcasts"
   readonly property string loginCommand: loginScript.replace(Quickshell.env("HOME"), "~")
-  onViewChanged: speedMenuOpen = false
+  onViewChanged: { speedMenuOpen = false; infoOpen = false }
 
   // "podcasts", "episodes" or "playing"
   property string view: "podcasts"
@@ -60,11 +67,37 @@ Panel {
     root.controller.show()
     if (podcastList.length === 0) loadPodcasts()
     if (nowPlaying.active && !needsLogin) view = "playing"
+    resync()
     pollStatus()
+  }
+
+  // After sleep the episode may have moved on another device: ask the session
+  // to adopt Overcast's saved position, then show the result.
+  function resync() {
+    if (!nowPlaying.active) return
+    Quickshell.execDetached([backend, "resync"])
+    statusDelay.interval = 1500
+    statusDelay.restart()
+  }
+
+  function loadInfo() {
+    if (!nowPath || (episodeInfoPath === nowPath && (episodeInfo || infoQuery.running))) return
+    var path = nowPath
+    episodeInfo = null
+    episodeInfoFailed = false
+    episodeInfoPath = path
+    infoQuery.request(["info", path], function(data) { if (root.nowPath === path) root.episodeInfo = data })
+  }
+
+  function showInfo() {
+    if (!nowPath) return
+    if (episodeInfoPath !== nowPath || (!episodeInfo && !infoQuery.running)) loadInfo()
+    infoOpen = true
   }
 
   function close() {
     settingsOpen = false
+    infoOpen = false
     root.controller.hide()
   }
 
@@ -214,12 +247,14 @@ Panel {
     id: q
     property var callback: null
     property var pending: null
+    property bool quiet: false
+    signal failed()
     running: false
     command: []
     stdout: StdioCollector { id: qOut; waitForEnd: true }
 
     function request(args, callback) {
-      root.error = ""
+      if (!quiet) root.error = ""
       if (running) {
         pending = { args: args, callback: callback }
         return
@@ -239,13 +274,17 @@ Panel {
       var data = null
       try { data = JSON.parse(String(qOut.text || "")) } catch (e) {}
       if (exitCode === 2) root.error = "not_logged_in"
-      else if (exitCode !== 0 || data === null) root.error = (data && data.error) || "Couldn't reach Overcast"
+      else if (exitCode !== 0 || data === null) {
+        if (quiet) failed()
+        else root.error = (data && data.error) || "Couldn't reach Overcast"
+      }
       else if (callback) callback(data)
     }
   }
 
   Query { id: podcastsQuery }
   Query { id: episodesQuery }
+  Query { id: infoQuery; quiet: true; onFailed: root.episodeInfoFailed = true }
 
   Process {
     id: logoutProc
@@ -302,7 +341,7 @@ Panel {
   Timer {
     id: statusDelay
     interval: 700
-    onTriggered: root.pollStatus()
+    onTriggered: { root.pollStatus(); interval = 700 }
   }
 
   // --- UI ---------------------------------------------------------------------
@@ -371,7 +410,8 @@ Panel {
     centerOnBar: true
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(420))
-    contentHeight: root.needsLogin && !root.settingsOpen
+    contentHeight: root.infoOpen ? panel.fittedContentHeight(Style.space(480))
+      : root.needsLogin && !root.settingsOpen
       ? panel.fittedContentHeight(content.implicitHeight)
       : root.settingsOpen
       ? panel.fittedContentHeight(settingsPage.implicitHeight + (olderDropdown.popupOpen ? olderDropdown.popupRowHeight * 7 + Style.space(16) : 0))
@@ -383,18 +423,19 @@ Panel {
       id: keyCatcher
       anchors.fill: parent
       onCloseRequested: {
-        if (root.settingsOpen) root.showSettings(false)
+        if (root.infoOpen) root.infoOpen = false
+        else if (root.settingsOpen) root.showSettings(false)
         else if (root.speedMenuOpen) root.speedMenuOpen = false
         else if (root.view === "episodes") root.back()
         else root.close()
       }
-      onActivateRequested: if (root.view === "playing" && !root.settingsOpen) root.togglePause()
+      onActivateRequested: if (root.view === "playing" && !root.settingsOpen && !root.infoOpen) root.togglePause()
       onTabRequested: function(direction) { root.switchPanel(direction) }
 
       Column {
         id: content
         anchors.fill: parent
-        visible: !root.settingsOpen
+        visible: !root.settingsOpen && !root.infoOpen
         spacing: Style.space(10)
 
         // ---- Header
@@ -510,18 +551,50 @@ Panel {
             asynchronous: true
           }
 
-          Text {
+          Column {
             width: parent.width
-            horizontalAlignment: Text.AlignHCenter
-            wrapMode: Text.Wrap
-            maximumLineCount: 2
-            elide: Text.ElideRight
-            text: root.nowPlaying.title || ""
-            color: root.fg
-            font.family: root.sansFamily
-            font.pixelSize: Math.round(Style.font.title * 1.3)
-            font.weight: Font.Bold
-            textFormat: Text.PlainText
+            spacing: Style.space(4)
+
+            Text {
+              visible: text !== ""
+              width: parent.width
+              horizontalAlignment: Text.AlignHCenter
+              text: root.nowPlaying.date || ""
+              color: root.fg
+              opacity: 0.6
+              font.family: root.sansFamily
+              font.pixelSize: Style.font.body
+              font.weight: Font.Normal
+              textFormat: Text.PlainText
+            }
+
+            Row {
+              width: parent.width
+              spacing: Style.space(6)
+
+              Text {
+                width: parent.width - infoButton.width - parent.spacing
+                horizontalAlignment: Text.AlignHCenter
+                wrapMode: Text.Wrap
+                maximumLineCount: 2
+                elide: Text.ElideRight
+                text: root.nowPlaying.title || ""
+                color: root.fg
+                font.family: root.sansFamily
+                font.pixelSize: Math.round(Style.font.title * 1.3)
+                font.weight: Font.Bold
+                textFormat: Text.PlainText
+              }
+
+              IconButton {
+                id: infoButton
+                width: Style.space(22)
+                height: width
+                iconScale: 1.0
+                glyph: 0xF02FD // md-information-outline
+                onClicked: root.showInfo()
+              }
+            }
           }
 
           Column {
@@ -646,7 +719,7 @@ Panel {
           Grid {
             visible: root.speedMenuOpen
             anchors.horizontalCenter: parent.horizontalCenter
-            columns: 4
+            columns: 3
             spacing: Style.space(6)
 
             Repeater {
@@ -887,6 +960,144 @@ Panel {
               hoverEnabled: true
               cursorShape: Qt.PointingHandCursor
               onClicked: row.isEpisode ? root.play(row.modelData) : root.openPodcast(row.modelData)
+            }
+          }
+        }
+      }
+
+      // ---- Episode info dialog
+      Column {
+        id: infoPage
+        anchors.fill: parent
+        visible: root.infoOpen
+        spacing: Style.space(10)
+
+        Item {
+          width: parent.width
+          implicitHeight: infoBackButton.implicitHeight
+          height: implicitHeight
+
+          PanelActionButton {
+            id: infoBackButton
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            iconText: "󰁍"
+            tooltipText: "Back"
+            foreground: root.fg
+            hoverColor: root.brand
+            fontFamily: root.monoFamily
+            onClicked: root.infoOpen = false
+          }
+
+          Text {
+            anchors.left: infoBackButton.right
+            anchors.leftMargin: Style.space(10)
+            anchors.verticalCenter: parent.verticalCenter
+            text: "EPISODE INFO"
+            color: root.fg
+            font.family: root.monoFamily
+            font.pixelSize: Style.font.title
+            font.bold: true
+          }
+        }
+
+        PanelSeparator {
+          width: parent.width
+          foreground: root.fg
+        }
+
+        Text {
+          visible: !root.episodeInfo
+          width: parent.width
+          horizontalAlignment: Text.AlignHCenter
+          text: root.episodeInfoFailed ? "Couldn't load episode info." : "Loading…"
+          color: root.fg
+          opacity: 0.6
+          font.family: root.sansFamily
+          font.pixelSize: Style.font.body
+        }
+
+        Flickable {
+          visible: !!root.episodeInfo
+          width: parent.width
+          height: parent.height - y
+          contentWidth: width
+          contentHeight: infoColumn.implicitHeight
+          clip: true
+          boundsBehavior: Flickable.StopAtBounds
+
+          Column {
+            id: infoColumn
+            width: parent.width
+            spacing: Style.space(10)
+
+            Image {
+              visible: root.showArtwork && source != ""
+              anchors.horizontalCenter: parent.horizontalCenter
+              width: Style.space(140)
+              height: visible ? width : 0
+              source: root.showArtwork && root.episodeInfo ? (root.episodeInfo.art || "") : ""
+              sourceSize.width: Style.space(280)
+              fillMode: Image.PreserveAspectCrop
+              asynchronous: true
+            }
+
+            component InfoLabel: Text {
+              width: infoColumn.width
+              color: root.fg
+              opacity: 0.6
+              font.family: root.monoFamily
+              font.pixelSize: Style.font.caption
+              font.bold: true
+            }
+            component InfoBody: Text {
+              width: infoColumn.width
+              wrapMode: Text.Wrap
+              color: root.fg
+              font.family: root.sansFamily
+              font.pixelSize: Style.font.body
+              textFormat: Text.PlainText
+            }
+
+            InfoLabel { text: "PODCAST" }
+            InfoBody { text: root.episodeInfo ? root.episodeInfo.podcast : ""; font.bold: true }
+            InfoBody {
+              visible: text !== ""
+              text: root.episodeInfo ? root.episodeInfo.podcastDescription : ""
+              opacity: 0.8
+            }
+            InfoBody {
+              visible: text !== ""
+              text: root.episodeInfo ? root.episodeInfo.podcastSite : ""
+              opacity: 0.5
+              font.family: root.monoFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            InfoLabel { text: "EPISODE" }
+            InfoBody { text: root.episodeInfo ? root.episodeInfo.title : ""; font.bold: true }
+            InfoBody {
+              visible: text !== ""
+              text: root.episodeInfo ? root.episodeInfo.date : ""
+              opacity: 0.6
+            }
+
+            InfoLabel { visible: notesText.visible; text: "NOTES" }
+            InfoBody {
+              id: notesText
+              visible: text !== ""
+              text: root.episodeInfo ? root.episodeInfo.notes : ""
+            }
+
+            LinkText {
+              visible: !!root.episodeInfo && root.episodeInfo.website !== ""
+              width: infoColumn.width
+              text: "Episode website ↗"
+              color: hovered ? root.fg : root.brand
+              onClicked: {
+                Quickshell.execDetached(["omarchy-launch-browser", root.episodeInfo.website])
+                root.close()
+              }
             }
           }
         }
