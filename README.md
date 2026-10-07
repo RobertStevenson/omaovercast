@@ -2,7 +2,10 @@
 
 An unofficial [Overcast](https://overcast.fm) podcast player for the Omarchy bar. Browse the podcasts you subscribe to, play episodes with mpv, and keep your place in sync with Overcast on your phone.
 
-![OmaOvercast now-playing screen](preview.png)
+<p align="center">
+  <img src="preview.png" alt="OmaOvercast now-playing screen" width="420">
+  <img src="settings.png" alt="OmaOvercast settings" width="420">
+</p>
 
 > **Unofficial.** OmaOvercast is not made by, affiliated with, or endorsed by Overcast. Overcast has no public API, so the plugin reads the same web pages you see when you log in at overcast.fm. If Overcast changes those pages, the plugin can break until it's updated.
 
