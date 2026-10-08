@@ -7,7 +7,9 @@ same endpoint its web player uses.
 
   overcast podcasts            JSON list of subscribed podcasts
   overcast episodes <path> [n] in-library episodes plus n older (None, 1-5), or All (newest 30)
-  overcast play <path>         play an episode (path like /+BTY0S2CNU4)
+  overcast play <path> [off|oldest|newest]
+                               play an episode (path like /+BTY0S2CNU4); when it plays to the
+                               end, autoplay the oldest (or newest) unplayed episode
   overcast status              JSON now-playing state
   overcast toggle|stop         pause/resume or stop playback
   overcast media-key back|forward  seek the episode if it's what you're listening to,
@@ -39,6 +41,9 @@ BASE = "https://overcast.fm"
 STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "omaovercast")
 COOKIE_JAR = os.path.join(STATE_DIR, "cookies.txt")
 NOW_FILE = os.path.join(STATE_DIR, "now.json")
+HANDOFF_FILE = os.path.join(STATE_DIR, "handoff.json")  # an autoplay is starting the next episode
+HANDOFF_SECONDS = 90
+AUTOPLAY_MODES = ("off", "oldest", "newest")
 PROGRESS_FINISHED_SENTINEL = 0x7FFFFFFF
 SYNC_INTERVAL = 10
 RESYNC_TOLERANCE = 5  # seconds of drift from the saved position that count as another device
@@ -216,6 +221,22 @@ def episode_info(path):
     return info
 
 
+def next_episode(podcast_path, current_path, mode):
+    """The oldest ("oldest") or newest ("newest") unplayed episode other than current_path, or None.
+
+    Overcast's pages give only the day, but list episodes in feed order (newest
+    first), so same-day episodes keep their order.
+    """
+    page = request(podcast_path)
+    cells = [(m["href"], "usernewepisode" in m["state"]) for m in EPISODE_CELL.finditer(page)]
+    if current_path not in [path for path, _ in cells]:
+        return None
+    for path, unplayed in (cells[::-1] if mode == "oldest" else cells):
+        if unplayed and path != current_path:
+            return path
+    return None
+
+
 def set_progress(item_id, position, speed_id, version):
     body = urllib.parse.urlencode({"p": int(position), "speed": speed_id, "v": version}).encode()
     try:
@@ -363,10 +384,11 @@ def stop_playback():
     remove_own_files(now)
 
 
-def play(path):
+def play(path, autoplay="off"):
     if not shutil.which("mpv"):
         raise RuntimeError("mpv is not installed")
     details = episode_details(path)
+    details["autoplay"] = autoplay
     with PlayLock():
         stop_playback()
         child = subprocess.Popen(
@@ -378,6 +400,10 @@ def play(path):
         for _ in range(150):
             now = read_now()
             if now and now.get("pid") == child.pid and os.path.exists(now["socket"]):
+                try:
+                    os.unlink(HANDOFF_FILE)
+                except FileNotFoundError:
+                    pass
                 return {"ok": True, "title": details["title"]}
             if child.poll() is not None:
                 break
@@ -403,7 +429,9 @@ def session(details):
 
     speed_id = details["speedId"]
     player = subprocess.Popen([
-        "mpv", "--no-video", "--no-terminal", "--idle=no",
+        # keep-open: at the end of the file mpv pauses instead of exiting, so a seek
+        # past the end (the +30 button) is seen as finishing the episode.
+        "mpv", "--no-video", "--no-terminal", "--idle=no", "--keep-open=yes",
         # Jump to the saved position by byte estimate instead of reading the
         # whole file up to it, which can take a minute or more on slow hosts.
         "--demuxer-lavf-o=fflags=+fastseek",
@@ -419,6 +447,7 @@ def session(details):
     last_synced = details["start"]
     position, duration = None, None
     resync_wanted = []
+    reached_end = False
 
     def resync():
         """Another device listened since we last synced: jump to where it got to."""
@@ -459,6 +488,9 @@ def session(details):
                     resync()
                 except (OSError, ValueError):
                     pass
+            if mpv_get(sock, "eof-reached"):
+                reached_end = True
+                break
             pos = mpv_get(sock, "time-pos")
             if pos is None:
                 continue
@@ -479,11 +511,26 @@ def session(details):
             except subprocess.TimeoutExpired:
                 player.kill()
         # Only save a position this session actually observed.
-        if position is not None:
-            finished = duration is not None and position >= duration - 5
+        if position is not None or reached_end:
+            finished = reached_end or (duration is not None and position >= duration - 5)
             final = PROGRESS_FINISHED_SENTINEL if finished else position
             set_progress(details["itemId"], final, speed_id, version)
+        upnext = None
+        if reached_end and details.get("autoplay") in ("oldest", "newest") and details.get("podcastPath"):
+            try:
+                upnext = next_episode(details["podcastPath"], details["path"], details["autoplay"])
+            except (urllib.error.URLError, NotLoggedIn, OSError):
+                pass
+        if upnext:
+            # Keeps the panel on the player through the gap between the two sessions.
+            with open(HANDOFF_FILE, "w") as f:
+                json.dump({"time": time.time(), "path": upnext}, f)
         remove_own_files(me)
+        # Hand over only if nothing else started playing meanwhile.
+        if upnext and not current_session():
+            subprocess.Popen([sys.executable, os.path.abspath(__file__), "play", upnext, details["autoplay"]],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
 
 
 def other_player_playing(own_pid):
@@ -544,6 +591,12 @@ def logout():
 def status():
     now = current_session()
     if not now:
+        try:
+            with open(HANDOFF_FILE) as f:
+                if time.time() - json.load(f)["time"] < HANDOFF_SECONDS:
+                    return {"active": False, "handoff": True}
+        except (FileNotFoundError, ValueError, KeyError):
+            pass
         return {"active": False}
     sock = now["socket"]
     return {
@@ -583,7 +636,8 @@ def main(argv):
         elif cmd == "episodes":
             result = episodes(args[0], parse_older(args[1] if len(args) > 1 else None))
         elif cmd == "play":
-            result = play(args[0])
+            mode = args[1] if len(args) > 1 and args[1] in AUTOPLAY_MODES else "off"
+            result = play(args[0], mode)
         elif cmd == "_session":
             session(json.loads(args[0]))
             return 0

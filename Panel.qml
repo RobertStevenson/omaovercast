@@ -21,6 +21,9 @@ Panel {
   // Overcast's orange (as used by its web player), or the theme's accent.
   readonly property bool themeColors: setting("accentColor", "Overcast") === "Theme"
   readonly property string olderEpisodes: String(setting("olderEpisodes", "4"))
+  readonly property string autoplay: String(setting("autoplay", "Off"))
+  // The backend's name for the autoplay setting.
+  readonly property string autoplayMode: autoplay === "Oldest first" ? "oldest" : autoplay === "Newest first" ? "newest" : "off"
   // Re-list the open podcast when the count changes.
   onOlderEpisodesChanged: if (view === "episodes" && currentPodcast) openPodcast(currentPodcast)
   readonly property color brand: themeColors ? Color.accent : "#fc7e0f"
@@ -145,6 +148,8 @@ Panel {
 
   function applyStatus(data) {
     if (!data.active && Date.now() - playRequestedAt < 8000) return
+    // Autoplay is starting the next episode: stay on the player until it does.
+    if (!data.active && data.handoff) return
     // Playback ended: leave the now-playing view for its podcast.
     if (nowPlaying.active && !data.active && view === "playing") openPlayingPodcast()
     nowPlaying = data
@@ -169,7 +174,7 @@ Panel {
       art: "", position: 0, duration: 0, paused: false
     }
     view = "playing"
-    action(["play", episode.path])
+    action(["play", episode.path, autoplayMode])
   }
   function togglePause() { if (nowPlaying.active) action(["toggle"]) }
   function seek(seconds) { action(["seek", String(seconds)]) }
@@ -1213,6 +1218,45 @@ Panel {
             width: parent.width
             wrapMode: Text.Wrap
             text: "Shown below the episodes still in your Overcast library."
+            color: root.fg
+            opacity: 0.5
+            font.family: root.monoFamily
+            font.pixelSize: Style.font.caption
+          }
+        }
+
+        Column {
+          width: parent.width
+          spacing: Style.space(6)
+
+          Text {
+            text: "AUTOPLAY NEXT EPISODE"
+            color: root.fg
+            opacity: 0.6
+            font.family: root.monoFamily
+            font.pixelSize: Style.font.caption
+            font.bold: true
+          }
+
+          ButtonGroup {
+            width: parent.width
+            options: [
+              { value: "Off", label: "Off" },
+              { value: "Oldest first", label: "Oldest first" },
+              { value: "Newest first", label: "Newest first" }
+            ]
+            value: root.autoplay
+            foreground: root.fg
+            background: Color.popups.background
+            accent: root.brand
+            fontFamily: root.monoFamily
+            onChanged: function(value) { root.persistSettings({ autoplay: value }) }
+          }
+
+          Text {
+            width: parent.width
+            wrapMode: Text.Wrap
+            text: "When an episode ends, or you skip past its end, play the oldest or newest unplayed episode of that podcast. Applies to episodes you start from now on."
             color: root.fg
             opacity: 0.5
             font.family: root.monoFamily

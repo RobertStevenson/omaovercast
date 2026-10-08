@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "robertstevenson.omaovercast",
   "name": "OmaOvercast",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "author": "RobertStevenson",
   "license": "MIT",
   "description": "Unofficial Overcast player for the Omarchy bar: browse your subscriptions, play episodes with mpv, and sync progress and speed back to your Overcast account.",
@@ -26,7 +26,8 @@
     "defaults": {
       "showArtwork": false,
       "accentColor": "Overcast",
-      "olderEpisodes": "4"
+      "olderEpisodes": "4",
+      "autoplay": "Off"
     },
     "schema": [
       {
@@ -62,6 +63,18 @@
         ],
         "defaultValue": "4",
         "description": "How many episodes older than the ones in your Overcast library to show for each podcast."
+      },
+      {
+        "key": "autoplay",
+        "type": "enum",
+        "label": "Autoplay next episode",
+        "options": [
+          "Off",
+          "Oldest first",
+          "Newest first"
+        ],
+        "defaultValue": "Off",
+        "description": "When an episode plays to the end (or you skip past it), start the oldest (Oldest first) or newest (Newest first) unplayed episode of that podcast."
       }
     ]
   }
