@@ -121,11 +121,54 @@ Panel {
     podcastsQuery.request(["podcasts"], function(data) { root.podcastList = data })
   }
 
-  function openPodcast(podcast) {
+  // Episode lists already fetched, by podcast and "older" setting, so going back
+  // to a podcast is instant. An entry older than five minutes is shown at once
+  // and refreshed quietly behind it; only the refresh button forces a reload.
+  readonly property int episodeCacheMs: 5 * 60 * 1000
+  property var episodeCache: ({})
+
+  // Playback of `prev` just ended or was replaced. If it got to (nearly) the end,
+  // show it as played in the cached lists straight away. Either way the entry is
+  // made to go stale in a few seconds, once the session has had time to save its
+  // position, so the next refresh confirms the real state with Overcast.
+  function noteEnded(prev) {
+    if (!prev || !prev.active || !prev.podcastPath) return
+    var finished = prev.duration > 0 && prev.position >= prev.duration - 20
+    function mark(list) {
+      return list.map(function(ep) {
+        return ep.path === prev.path ? Object.assign({}, ep, { played: true, new: false }) : ep
+      })
+    }
+    var settle = Date.now() - episodeCacheMs + 6000
+    for (var key in episodeCache) {
+      if (key.indexOf(prev.podcastPath + "|") !== 0) continue
+      episodeCache[key] = { data: finished ? mark(episodeCache[key].data) : episodeCache[key].data, time: settle }
+    }
+    if (currentPodcast && currentPodcast.path === prev.podcastPath) {
+      if (finished) episodeList = mark(episodeList)
+      confirmTimer.restart()
+    }
+  }
+
+  // Re-reads the open podcast once an ended session has saved, replacing the
+  // optimistic state with Overcast's.
+  Timer {
+    id: confirmTimer
+    interval: 7000
+    onTriggered: if (root.view === "episodes" && root.currentPodcast) root.openPodcast(root.currentPodcast)
+  }
+
+  function openPodcast(podcast, force) {
+    var key = podcast.path + "|" + olderEpisodes
+    var cached = force ? null : episodeCache[key]
     currentPodcast = podcast
-    episodeList = []
     view = "episodes"
-    episodesQuery.request(["episodes", podcast.path, olderEpisodes], function(data) { root.episodeList = data })
+    episodeList = cached ? cached.data : []
+    if (cached && Date.now() - cached.time < episodeCacheMs) return
+    episodesQuery.request(["episodes", podcast.path, olderEpisodes], function(data) {
+      root.episodeCache[key] = { data: data, time: Date.now() }
+      if (root.currentPodcast && root.currentPodcast.path === podcast.path) root.episodeList = data
+    })
   }
 
   function back() {
@@ -150,6 +193,8 @@ Panel {
     if (!data.active && Date.now() - playRequestedAt < 8000) return
     // Autoplay is starting the next episode: stay on the player until it does.
     if (!data.active && data.handoff) return
+    // Playback ended (or moved on to another episode): update that episode in the cache.
+    if (nowPlaying.active && (!data.active || data.path !== nowPlaying.path)) noteEnded(nowPlaying)
     // Playback ended: leave the now-playing view for its podcast.
     if (nowPlaying.active && !data.active && view === "playing") openPlayingPodcast()
     nowPlaying = data
@@ -159,7 +204,7 @@ Panel {
   function refresh() {
     if (view === "episodes" && currentPodcast) {
       episodeList = []
-      openPodcast(currentPodcast)
+      openPodcast(currentPodcast, true)
     } else {
       podcastList = []
       loadPodcasts()
@@ -172,6 +217,7 @@ Panel {
   }
 
   function play(episode) {
+    if (nowPlaying.active && nowPlaying.path !== episode.path) noteEnded(nowPlaying)
     playRequestedAt = Date.now()
     nowPlaying = {
       active: true, title: episode.title, path: episode.path,
@@ -245,6 +291,7 @@ Panel {
     nowPlaying = { active: false }
     podcastList = []
     episodeList = []
+    episodeCache = ({})
     currentPodcast = null
     episodeInfo = null
     episodeInfoFailed = false
@@ -320,6 +367,7 @@ Panel {
     onExited: {
       root.podcastList = []
       root.episodeList = []
+      root.episodeCache = ({})
       root.currentPodcast = null
       root.nowPlaying = { active: false }
       root.view = "podcasts"
