@@ -155,9 +155,15 @@ Panel {
     nowPlaying = data
   }
 
+  // Manual refresh starts clean: drop what is showing so stale rows can't linger.
   function refresh() {
-    if (view === "episodes" && currentPodcast) openPodcast(currentPodcast)
-    else loadPodcasts()
+    if (view === "episodes" && currentPodcast) {
+      episodeList = []
+      openPodcast(currentPodcast)
+    } else {
+      podcastList = []
+      loadPodcasts()
+    }
   }
 
   function action(args) {
@@ -234,6 +240,21 @@ Panel {
     if (!logoutProc.running) logoutProc.running = true
   }
 
+  // Pause and end playback (saving its position unless Overcast has the episode played), drop everything cached in the panel, and reload from Overcast.
+  function cleanAndRefresh() {
+    nowPlaying = { active: false }
+    podcastList = []
+    episodeList = []
+    currentPodcast = null
+    episodeInfo = null
+    episodeInfoFailed = false
+    episodeInfoPath = ""
+    view = "podcasts"
+    settingsOpen = false
+    // Reload once the session has ended, so the lists reflect what it saved.
+    cleanQuery.request(["clean"], function() { root.loadPodcasts() })
+  }
+
   function copyLoginCommand() {
     Quickshell.execDetached(["bash", "-c", "printf %s \"$1\" | wl-copy", "copy", loginScript])
     loginCopiedTimer.restart()
@@ -289,6 +310,7 @@ Panel {
 
   Query { id: podcastsQuery }
   Query { id: episodesQuery }
+  Query { id: cleanQuery }
   Query { id: infoQuery; quiet: true; onFailed: root.episodeInfoFailed = true }
 
   Process {
@@ -515,8 +537,16 @@ Panel {
             LinkText {
               visible: root.view !== "playing" && !root.needsLogin
               anchors.verticalCenter: parent.verticalCenter
-              text: root.loading ? "…" : "↻"
+              // md-sync: two arrows chasing each other in a circle; spins while loading.
+              text: String.fromCodePoint(0xF04E6)
+              font.family: root.monoFamily
               onClicked: root.refresh()
+              NumberAnimation on rotation {
+                from: 0; to: 360; duration: 900
+                loops: Animation.Infinite
+                running: root.loading
+                onRunningChanged: if (!running) parent.rotation = 0
+              }
             }
             PanelActionButton {
               anchors.verticalCenter: parent.verticalCenter
@@ -1270,6 +1300,54 @@ Panel {
           spacing: Style.space(6)
 
           Text {
+            text: "DATA"
+            color: root.fg
+            opacity: 0.6
+            font.family: root.monoFamily
+            font.pixelSize: Style.font.caption
+            font.bold: true
+          }
+
+          Item {
+            width: parent.width
+            implicitHeight: Math.max(cleanButton.implicitHeight, cleanButtonNote.implicitHeight)
+
+            Text {
+              id: cleanButtonNote
+              anchors.left: parent.left
+              anchors.right: cleanButton.left
+              anchors.rightMargin: Style.space(12)
+              anchors.verticalCenter: parent.verticalCenter
+              wrapMode: Text.Wrap
+              text: "Does a full refresh of data from Overcast after cleaning all data and pausing any playing podcast (saving your place unless Overcast already has it marked played)."
+              color: root.fg
+              opacity: 0.5
+              font.family: root.monoFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            Button {
+              id: cleanButton
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              text: "Clean All & Refresh"
+              bordered: true
+              foreground: root.fg
+              background: Color.popups.background
+              accent: root.brand
+              fontFamily: root.monoFamily
+              fontSize: Style.font.body
+              onClicked: root.cleanAndRefresh()
+            }
+          }
+        }
+
+        Column {
+          visible: !root.needsLogin
+          width: parent.width
+          spacing: Style.space(6)
+
+          Text {
             text: "ACCOUNT"
             color: root.fg
             opacity: 0.6
@@ -1280,9 +1358,10 @@ Panel {
 
           Item {
             width: parent.width
-            implicitHeight: logoutButton.implicitHeight
+            implicitHeight: Math.max(logoutButton.implicitHeight, logoutButtonNote.implicitHeight)
 
             Text {
+              id: logoutButtonNote
               anchors.left: parent.left
               anchors.right: logoutButton.left
               anchors.rightMargin: Style.space(12)

@@ -14,6 +14,8 @@ same endpoint its web player uses.
   overcast toggle|stop         pause/resume or stop playback
   overcast media-key back|forward  seek the episode if it's what you're listening to,
                                else Omarchy's previous/next track (for media key bindings)
+  overcast clean               pause and end the session; its position is saved unless Overcast
+                               already has the episode marked played
   overcast logout              stop playback, end the session, delete the cookie
   overcast seek <seconds> [absolute]  relative seek, or to a position
   overcast speed <id>          set speed by Overcast id (750, 0=1x, 1250 ... 2000)
@@ -573,6 +575,43 @@ def media_key(direction):
     return {"ok": True, "track": direction}
 
 
+def episode_played(podcast_path, path):
+    """Whether Overcast lists the episode as played; None if that can't be told."""
+    if not podcast_path:
+        return None
+    try:
+        page = request(podcast_path)
+    except (urllib.error.URLError, NotLoggedIn, OSError):
+        return None
+    for m in EPISODE_CELL.finditer(page):
+        if m["href"] == path:
+            return "usernewepisode" not in m["state"]
+    return None
+
+
+def clean_playback():
+    """Pause, then end the session. A played episode's position is not saved, so a
+    stale session can't turn it back into a partly-listened one."""
+    now = current_session()
+    if not now:
+        return {"ok": True, "saved": False}
+    try:
+        mpv(now["socket"], "set_property", "pause", True)
+    except (OSError, ValueError):
+        pass
+    if episode_played(now.get("podcastPath"), now["path"]):
+        # SIGKILL skips the session's final save; its mpv dies with it.
+        try:
+            os.kill(now["pid"], signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        wait_for_exit(now["pid"], 3)
+        remove_own_files(now)
+        return {"ok": True, "saved": False}
+    stop_playback()
+    return {"ok": True, "saved": True}
+
+
 def logout():
     """Stop playback (saving its position), end the Overcast session, forget the cookie."""
     with PlayLock():
@@ -669,6 +708,9 @@ def main(argv):
             result = media_key(args[0])
         elif cmd == "logout":
             result = logout()
+        elif cmd == "clean":
+            with PlayLock():
+                result = clean_playback()
         elif cmd == "stop":
             with PlayLock():
                 stop_playback()
